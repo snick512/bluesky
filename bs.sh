@@ -6,6 +6,7 @@ APP_PASSWORD=""
 API_URL="https://bsky.social"
 AUTH_ENDPOINT="$API_URL/xrpc/com.atproto.server.createSession"
 POST_ENDPOINT="$API_URL/xrpc/com.atproto.repo.createRecord"
+BLOB_ENDPOINT="$API_URL/xrpc/com.atproto.repo.uploadBlob"
 
 # Step 1: Authenticate
 echo "[*] Authenticating..."
@@ -28,7 +29,6 @@ POST_TEXT=$(zenity --entry \
   --width=800)
 
 if [ -z "$POST_TEXT" ]; then
-  #zenity --info --text="No post text entered. Exiting."
   exit 0
 fi
 
@@ -37,10 +37,74 @@ if [ "${#POST_TEXT}" -gt 300 ]; then
   exit 1
 fi
 
+# Step 3: Ask for image file (optional)
+IMAGE_FILE=$(zenity --file-selection \
+  --title="Select an image to attach (or cancel to skip)" \
+  --file-filter="Images | *.png *.jpg *.jpeg *.webp")
+
+# Step 4: If image selected, compress and upload
+if [ -n "$IMAGE_FILE" ]; then
+  echo "[*] Compressing and uploading image: $IMAGE_FILE"
+
+  EXT="${IMAGE_FILE##*.}"
+  TMP_IMAGE="/tmp/bluesky_compressed.$EXT"
+
+  if command -v convert &> /dev/null; then
+    convert "$IMAGE_FILE" -resize 1024x1024\> -strip -quality 75 "$TMP_IMAGE"
+  elif command -v ffmpeg &> /dev/null; then
+    ffmpeg -i "$IMAGE_FILE" -vf "scale='min(1024,iw)':-2" -qscale:v 5 "$TMP_IMAGE" -y
+  else
+    zenity --error --text="Image compression tools (ImageMagick or ffmpeg) not found. Please install one to attach images."
+    exit 1
+  fi
+
+  IMAGE_MIME=$(file -b --mime-type "$TMP_IMAGE")
+
+  IMAGE_RESP=$(curl -s -X POST "$BLOB_ENDPOINT" \
+    -H "Authorization: Bearer $ACCESS_JWT" \
+    -H "Content-Type: $IMAGE_MIME" \
+    --data-binary "@$TMP_IMAGE")
+
+  BLOB_REF=$(echo "$IMAGE_RESP" | jq -c '.blob')
+  rm -f "$TMP_IMAGE"
+
+  if [ "$BLOB_REF" == "null" ] || [ -z "$BLOB_REF" ]; then
+    zenity --error --text="Failed to upload image. Continuing without it."
+    BLOB_REF=""
+  fi
+else
+  BLOB_REF=""
+fi
+
+
 CURRENT_TIME=$(date --utc +%Y-%m-%dT%H:%M:%SZ)
 
-# Step 3: Prepare post payload
-read -r -d '' POST_DATA <<EOF
+# Step 5: Build the post payload
+if [ -n "$BLOB_REF" ]; then
+  # Payload with image embed
+  read -r -d '' POST_DATA <<EOF
+{
+  "repo": "$DID",
+  "collection": "app.bsky.feed.post",
+  "record": {
+    "\$type": "app.bsky.feed.post",
+    "text": "$POST_TEXT",
+    "createdAt": "$CURRENT_TIME",
+    "embed": {
+      "\$type": "app.bsky.embed.images",
+      "images": [
+        {
+          "image": $BLOB_REF,
+          "alt": "Image uploaded via Bash"
+        }
+      ]
+    }
+  }
+}
+EOF
+else
+  # Payload without image
+  read -r -d '' POST_DATA <<EOF
 {
   "repo": "$DID",
   "collection": "app.bsky.feed.post",
@@ -51,8 +115,9 @@ read -r -d '' POST_DATA <<EOF
   }
 }
 EOF
+fi
 
-# Step 4: Send the post
+# Step 6: Send the post
 POST_RESP=$(curl -s -X POST "$POST_ENDPOINT" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $ACCESS_JWT" \
@@ -60,18 +125,18 @@ POST_RESP=$(curl -s -X POST "$POST_ENDPOINT" \
 
 URI=$(echo "$POST_RESP" | jq -r '.uri')
 
-# Step 5: Handle result
+# Step 7: Handle result
 if [[ "$URI" != "null" && -n "$URI" ]]; then
   POST_URL="https://bsky.app/profile/${DID}/post/$(basename "$URI")"
 
-  # Try to copy to clipboard (Linux: xclip, macOS: pbcopy)
+  # Copy to clipboard if available
   if command -v xclip &> /dev/null; then
     echo "$POST_URL" | xclip -selection clipboard
   elif command -v pbcopy &> /dev/null; then
     echo "$POST_URL" | pbcopy
   fi
 
-  #zenity --info --text="✅ Post successful!\n\nURL copied to clipboard:\n$POST_URL"
+  zenity --info --text="✅ Post successful!\n\nURL copied to clipboard:\n$POST_URL"
 else
   ERR_MSG=$(echo "$POST_RESP" | jq -r '.error // "Unknown error"')
   zenity --error --text="❌ Failed to post:\n$ERR_MSG"
