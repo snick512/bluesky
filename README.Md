@@ -1,4 +1,4 @@
-# Bluesky CLI post
+# Bluesky post
 
 - bash
 - curl
